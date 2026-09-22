@@ -17,7 +17,7 @@ select STDERR; $| = 1;
 select STDOUT; $| = 1;
 
 my $t = Test::Nginx->new()->has(qw/http http_v2 http_v3 proxy rewrite cryptx/)
-    ->has_daemon('openssl')->plan(26);
+    ->has_daemon('openssl')->plan(38);
 
 $t->write_file_expand('nginx.conf', <<'EOF');
 %%TEST_GLOBALS%%
@@ -39,6 +39,17 @@ http {
             proxy_http_version 1.1;
             proxy_pass http://127.0.0.1:8081/read;
         }
+        location /post-body {
+            post_action /post-done;
+            proxy_pass http://127.0.0.1:8081/done;
+        }
+        location /post-stream {
+            post_action /post-done;
+            proxy_request_buffering off;
+            proxy_http_version 1.1;
+            proxy_pass http://127.0.0.1:8081/read;
+        }
+        location = /post-done { return 204; }
         location /off {
             client_body_total_timeout 0;
             proxy_pass http://127.0.0.1:8081/done;
@@ -98,6 +109,23 @@ for my $version (2, 3) {
         $sid = $s->new_stream({ path => '/health' });
         is(response_status($s, $sid), 200,
             "h$version $mode connection survives stream timeout");
+    }
+
+    for my $mode ('post-body', 'post-stream') {
+        my $path = "/$mode/v$version";
+        my $s = $class->new();
+        my $sid = $s->new_stream({ path => $path, method => 'POST',
+            body_more => 1 });
+        send_body($s, $version, $sid, 'TE', 1);
+        my $frames = $s->read(all => [{ type => $reset }], wait => 1);
+        ok(scalar(grep { $_->{type} eq $reset && $_->{sid} == $sid } @$frames),
+            "h$version $mode deadline closes stream");
+        like($t->read_file('access.log'),
+            qr!POST \Q$path\E HTTP/$version\.0"!,
+            "h$version $mode timeout post_action request is logged");
+        $sid = $s->new_stream({ path => '/health' });
+        is(response_status($s, $sid), 200,
+            "h$version $mode connection survives post_action");
     }
 
     my $s = $class->new();

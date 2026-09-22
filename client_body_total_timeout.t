@@ -19,7 +19,7 @@ use Test::Nginx qw/ http_start http_end /;
 select STDERR; $| = 1;
 select STDOUT; $| = 1;
 
-my $t = Test::Nginx->new()->has(qw/http proxy rewrite mirror/)->plan(22);
+my $t = Test::Nginx->new()->has(qw/http proxy rewrite mirror/)->plan(24);
 
 $t->write_file_expand('nginx.conf', <<'EOF');
 %%TEST_GLOBALS%%
@@ -51,6 +51,17 @@ http {
             proxy_http_version 1.1;
             proxy_pass http://127.0.0.1:8081/read;
         }
+        location /post-buffered {
+            post_action /post-done;
+            proxy_pass http://127.0.0.1:8081/done;
+        }
+        location /post-stream {
+            post_action /post-done;
+            proxy_request_buffering off;
+            proxy_http_version 1.1;
+            proxy_pass http://127.0.0.1:8081/read;
+        }
+        location = /post-done { return 204; }
         location /delayed {
             proxy_pass http://127.0.0.1:8082;
         }
@@ -112,6 +123,14 @@ for my $path ('/fixed', '/stream') {
         "$path terminates with timeout status");
 }
 
+for my $path ('/post-buffered', '/post-stream') {
+    my $s = http_start(request($path, 'TE'));
+    http_end($s);
+    like(wait_for_log($t, qr!POST \Q$path\E HTTP/1.1"!),
+        qr!POST \Q$path\E HTTP/1.1"!,
+        "$path request is logged after timeout post_action");
+}
+
 like(http(chunked('/', "4\r\nTEST\r\n0\r\n\r\n")),
     qr/X-Body: TEST/, 'complete chunked body');
 my $s = http_start(chunked('/chunked', "4\r\nTE"));
@@ -153,6 +172,20 @@ like(http_get('/delayed'), qr/ 200 /,
     'absent body does not time out during response');
 
 $t->stop();
+
+sub wait_for_log {
+    my ($test, $pattern) = @_;
+    my $deadline = time() + 2;
+    my $log;
+
+    while (time() < $deadline) {
+        $log = $test->read_file('access.log');
+        return $log if $log =~ $pattern;
+        select undef, undef, undef, 0.05;
+    }
+
+    return $log;
+}
 
 sub request {
     my ($path, $body, $length) = @_;
